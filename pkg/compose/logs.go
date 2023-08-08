@@ -20,9 +20,12 @@ import (
 	"context"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/docker/compose/v2/pkg/api"
@@ -42,50 +45,75 @@ func (s *composeService) Logs(
 		return err
 	}
 
-	project := options.Project
-	if project == nil {
-		project, err = s.getProjectWithResources(ctx, containers, projectName)
-		if err != nil {
-			return err
-		}
+	if options.Project != nil && len(options.Services) == 0 {
+		// we run with an explicit compose.yaml, so only consider services defined in this file
+		options.Services = options.Project.ServiceNames()
+		containers = containers.filter(isService(options.Services...))
 	}
 
-	if len(options.Services) == 0 {
-		options.Services = project.ServiceNames()
-	}
-
-	containers = containers.filter(isService(options.Services...))
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, c := range containers {
 		c := c
 		eg.Go(func() error {
-			return s.logContainers(ctx, consumer, c, options)
+			err := s.logContainers(ctx, consumer, c, options)
+			if _, ok := err.(errdefs.ErrNotImplemented); ok {
+				logrus.Warnf("Can't retrieve logs for %q: %s", getCanonicalContainerName(c), err.Error())
+				return nil
+			}
+			return err
 		})
 	}
 
 	if options.Follow {
+		containers = containers.filter(isRunning())
 		printer := newLogPrinter(consumer)
+		eg.Go(func() error {
+			_, err := printer.Run(false, "", nil)
+			return err
+		})
+
 		for _, c := range containers {
 			printer.HandleEvent(api.ContainerEvent{
 				Type:      api.ContainerEventAttach,
 				Container: getContainerNameWithoutProject(c),
+				ID:        c.ID,
 				Service:   c.Labels[api.ServiceLabel],
 			})
 		}
 
 		eg.Go(func() error {
-			return s.watchContainers(ctx, projectName, options.Services, nil, printer.HandleEvent, containers, func(c types.Container) error {
+			err := s.watchContainers(ctx, projectName, options.Services, nil, printer.HandleEvent, containers, func(c types.Container, t time.Time) error {
 				printer.HandleEvent(api.ContainerEvent{
 					Type:      api.ContainerEventAttach,
 					Container: getContainerNameWithoutProject(c),
+					ID:        c.ID,
 					Service:   c.Labels[api.ServiceLabel],
 				})
-				return s.logContainers(ctx, consumer, c, options)
+				eg.Go(func() error {
+					err := s.logContainers(ctx, consumer, c, api.LogOptions{
+						Follow:     options.Follow,
+						Since:      t.Format(time.RFC3339Nano),
+						Until:      options.Until,
+						Tail:       options.Tail,
+						Timestamps: options.Timestamps,
+					})
+					if _, ok := err.(errdefs.ErrNotImplemented); ok {
+						// ignore
+						return nil
+					}
+					return err
+				})
+				return nil
+			}, func(c types.Container, t time.Time) error {
+				printer.HandleEvent(api.ContainerEvent{
+					Type:      api.ContainerEventAttach,
+					Container: "", // actual name will be set by start event
+					ID:        c.ID,
+					Service:   c.Labels[api.ServiceLabel],
+				})
+				return nil
 			})
-		})
-
-		eg.Go(func() error {
-			_, err := printer.Run(ctx, false, "", nil)
+			printer.Stop()
 			return err
 		})
 	}

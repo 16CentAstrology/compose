@@ -24,15 +24,15 @@ import (
 )
 
 type removeOptions struct {
-	*projectOptions
+	*ProjectOptions
 	force   bool
 	stop    bool
 	volumes bool
 }
 
-func removeCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func removeCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 	opts := removeOptions{
-		projectOptions: p,
+		ProjectOptions: p,
 	}
 	cmd := &cobra.Command{
 		Use:   "rm [OPTIONS] [SERVICE...]",
@@ -64,20 +64,11 @@ func runRemove(ctx context.Context, backend api.Service, opts removeOptions, ser
 		return err
 	}
 
-	if opts.stop {
-		err := backend.Stop(ctx, name, api.StopOptions{
-			Services: services,
-			Project:  project,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
 	return backend.Remove(ctx, name, api.RemoveOptions{
 		Services: services,
 		Force:    opts.force,
 		Volumes:  opts.volumes,
 		Project:  project,
+		Stop:     opts.stop,
 	})
 }

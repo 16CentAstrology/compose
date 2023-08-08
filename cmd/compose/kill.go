@@ -27,14 +27,14 @@ import (
 )
 
 type killOptions struct {
-	*projectOptions
+	*ProjectOptions
 	removeOrphans bool
 	signal        string
 }
 
-func killCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func killCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 	opts := killOptions{
-		projectOptions: p,
+		ProjectOptions: p,
 	}
 	cmd := &cobra.Command{
 		Use:   "kill [OPTIONS] [SERVICE...]",
@@ -46,7 +46,7 @@ func killCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	removeOrphans := utils.StringToBool(os.Getenv("COMPOSE_REMOVE_ORPHANS"))
+	removeOrphans := utils.StringToBool(os.Getenv(ComposeRemoveOrphans))
 	flags.BoolVar(&opts.removeOrphans, "remove-orphans", removeOrphans, "Remove containers for services not defined in the Compose file.")
 	flags.StringVarP(&opts.signal, "signal", "s", "SIGKILL", "SIGNAL to send to the container.")
 
@@ -65,5 +65,4 @@ func runKill(ctx context.Context, backend api.Service, opts killOptions, service
 		Services:      services,
 		Signal:        opts.signal,
 	})
-
 }

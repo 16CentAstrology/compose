@@ -19,22 +19,23 @@ package compose
 import (
 	"context"
 
+	"github.com/compose-spec/compose-go/types"
 	"github.com/spf13/cobra"
 
 	"github.com/docker/compose/v2/pkg/api"
 )
 
 type pushOptions struct {
-	*projectOptions
+	*ProjectOptions
 	composeOptions
 	IncludeDeps    bool
 	Ignorefailures bool
 	Quiet          bool
 }
 
-func pushCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func pushCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 	opts := pushOptions{
-		projectOptions: p,
+		ProjectOptions: p,
 	}
 	pushCmd := &cobra.Command{
 		Use:   "push [OPTIONS] [SERVICE...]",
@@ -52,13 +53,13 @@ func pushCommand(p *projectOptions, backend api.Service) *cobra.Command {
 }
 
 func runPush(ctx context.Context, backend api.Service, opts pushOptions, services []string) error {
-	project, err := opts.toProject(services)
+	project, err := opts.ToProject(services)
 	if err != nil {
 		return err
 	}
 
 	if !opts.IncludeDeps {
-		err := withSelectedServicesOnly(project, services)
+		err := project.ForServices(services, types.IgnoreDependencies)
 		if err != nil {
 			return err
 		}

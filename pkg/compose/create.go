@@ -48,10 +48,24 @@ import (
 	"github.com/docker/compose/v2/pkg/utils"
 )
 
+type createOptions struct {
+	AutoRemove        bool
+	AttachStdin       bool
+	UseNetworkAliases bool
+	Labels            types.Labels
+}
+
+type createConfigs struct {
+	Container *container.Config
+	Host      *container.HostConfig
+	Network   *network.NetworkingConfig
+	Links     []string
+}
+
 func (s *composeService) Create(ctx context.Context, project *types.Project, options api.CreateOptions) error {
-	return progress.Run(ctx, func(ctx context.Context) error {
+	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
 		return s.create(ctx, project, options)
-	})
+	}, s.stdinfo(), "Creating")
 }
 
 func (s *composeService) create(ctx context.Context, project *types.Project, options api.CreateOptions) error {
@@ -106,11 +120,6 @@ func (s *composeService) create(ctx context.Context, project *types.Project, opt
 		}
 	}
 
-	err = prepareServicesDependsOn(project)
-	if err != nil {
-		return err
-	}
-
 	return newConvergence(options.Services, observedState, s).apply(ctx, project, options)
 }
 
@@ -130,6 +139,7 @@ func prepareVolumes(p *types.Project) error {
 					p.Services[i].DependsOn[service.Name].Condition == "" {
 					p.Services[i].DependsOn[service.Name] = types.ServiceDependency{
 						Condition: types.ServiceConditionStarted,
+						Required:  true,
 					}
 				}
 			}
@@ -147,78 +157,13 @@ func prepareNetworks(project *types.Project) {
 	}
 }
 
-func prepareServicesDependsOn(p *types.Project) error {
-	allServices := types.Project{}
-	allServices.Services = p.AllServices()
-
-	for i, service := range p.Services {
-		var dependencies []string
-		networkDependency := getDependentServiceFromMode(service.NetworkMode)
-		if networkDependency != "" {
-			dependencies = append(dependencies, networkDependency)
-		}
-
-		ipcDependency := getDependentServiceFromMode(service.Ipc)
-		if ipcDependency != "" {
-			dependencies = append(dependencies, ipcDependency)
-		}
-
-		pidDependency := getDependentServiceFromMode(service.Pid)
-		if pidDependency != "" {
-			dependencies = append(dependencies, pidDependency)
-		}
-
-		for _, vol := range service.VolumesFrom {
-			spec := strings.Split(vol, ":")
-			if len(spec) == 0 {
-				continue
-			}
-			if spec[0] == "container" {
-				continue
-			}
-			dependencies = append(dependencies, spec[0])
-		}
-
-		for _, link := range service.Links {
-			dependencies = append(dependencies, strings.Split(link, ":")[0])
-		}
-
-		for d := range service.DependsOn {
-			dependencies = append(dependencies, d)
-		}
-
-		if len(dependencies) == 0 {
-			continue
-		}
-
-		// Verify dependencies exist in the project, whether disabled or not
-		deps, err := allServices.GetServices(dependencies...)
-		if err != nil {
-			return err
-		}
-
-		if service.DependsOn == nil {
-			service.DependsOn = make(types.DependsOnConfig)
-		}
-
-		for _, d := range deps {
-			if _, ok := service.DependsOn[d.Name]; !ok {
-				service.DependsOn[d.Name] = types.ServiceDependency{
-					Condition: types.ServiceConditionStarted,
-				}
-			}
-		}
-		p.Services[i] = service
-	}
-	return nil
-}
-
 func (s *composeService) ensureNetworks(ctx context.Context, networks types.Networks) error {
-	for _, network := range networks {
-		err := s.ensureNetwork(ctx, network)
+	for i, network := range networks {
+		err := s.ensureNetwork(ctx, &network)
 		if err != nil {
 			return err
 		}
+		networks[i] = network
 	}
 	return nil
 }
@@ -236,12 +181,16 @@ func (s *composeService) ensureProjectVolumes(ctx context.Context, project *type
 	return nil
 }
 
-func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project, service types.ServiceConfig,
-	number int, inherit *moby.Container, autoRemove bool, attachStdin bool) (*container.Config, *container.HostConfig, *network.NetworkingConfig, error) {
-
-	labels, err := s.prepareLabels(service, number)
+func (s *composeService) getCreateConfigs(ctx context.Context,
+	p *types.Project,
+	service types.ServiceConfig,
+	number int,
+	inherit *moby.Container,
+	opts createOptions,
+) (createConfigs, error) {
+	labels, err := s.prepareLabels(opts.Labels, service, number)
 	if err != nil {
-		return nil, nil, nil, err
+		return createConfigs{}, err
 	}
 
 	var (
@@ -260,11 +209,6 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 		stdinOpen = service.StdinOpen
 	)
 
-	binds, mounts, err := s.buildContainerVolumes(ctx, *p, service, inherit)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
 	proxyConfig := types.MappingWithEquals(s.configFile().ParseProxyConfig(s.apiClient().DaemonHost(), nil))
 	env := proxyConfig.OverrideBy(service.Environment)
 
@@ -275,8 +219,8 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 		ExposedPorts:    buildContainerPorts(service),
 		Tty:             tty,
 		OpenStdin:       stdinOpen,
-		StdinOnce:       attachStdin && stdinOpen,
-		AttachStdin:     attachStdin,
+		StdinOnce:       opts.AttachStdin && stdinOpen,
+		AttachStdin:     opts.AttachStdin,
 		AttachStderr:    true,
 		AttachStdout:    true,
 		Cmd:             runCmd,
@@ -292,46 +236,7 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 		StopTimeout:     ToSeconds(service.StopGracePeriod),
 	}
 
-	portBindings := buildContainerPortBindingOptions(service)
-
-	resources := getDeployResources(service)
-
-	if service.NetworkMode == "" {
-		service.NetworkMode = getDefaultNetworkMode(p, service)
-	}
-
-	var networkConfig *network.NetworkingConfig
-
-	for _, id := range service.NetworksByPriority() {
-		net := p.Networks[id]
-		config := service.Networks[id]
-		var ipam *network.EndpointIPAMConfig
-		var (
-			ipv4Address string
-			ipv6Address string
-		)
-		if config != nil {
-			ipv4Address = config.Ipv4Address
-			ipv6Address = config.Ipv6Address
-			ipam = &network.EndpointIPAMConfig{
-				IPv4Address:  ipv4Address,
-				IPv6Address:  ipv6Address,
-				LinkLocalIPs: config.LinkLocalIPs,
-			}
-		}
-		networkConfig = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				net.Name: {
-					Aliases:     getAliases(service, config),
-					IPAddress:   ipv4Address,
-					IPv6Gateway: ipv6Address,
-					IPAMConfig:  ipam,
-				},
-			},
-		}
-		break //nolint:staticcheck
-	}
-
+	// VOLUMES/MOUNTS/FILESYSTEMS
 	tmpfs := map[string]string{}
 	for _, t := range service.Tmpfs {
 		if arr := strings.SplitN(t, ":", 2); len(arr) > 1 {
@@ -340,7 +245,28 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 			tmpfs[arr[0]] = ""
 		}
 	}
+	binds, mounts, err := s.buildContainerVolumes(ctx, *p, service, inherit)
+	if err != nil {
+		return createConfigs{}, err
+	}
+	var volumesFrom []string
+	for _, v := range service.VolumesFrom {
+		if !strings.HasPrefix(v, "container:") {
+			return createConfigs{}, fmt.Errorf("invalid volume_from: %s", v)
+		}
+		volumesFrom = append(volumesFrom, v[len("container:"):])
+	}
 
+	// NETWORKING
+	links, err := s.getLinks(ctx, p.Name, service, number)
+	if err != nil {
+		return createConfigs{}, err
+	}
+	networkMode, networkingConfig := defaultNetworkSettings(p, service, number, links, opts.UseNetworkAliases)
+	portBindings := buildContainerPortBindingOptions(service)
+
+	// MISC
+	resources := getDeployResources(service)
 	var logConfig container.LogConfig
 	if service.Logging != nil {
 		logConfig = container.LogConfig{
@@ -348,33 +274,21 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 			Config: service.Logging.Options,
 		}
 	}
-
-	var volumesFrom []string
-	for _, v := range service.VolumesFrom {
-		if !strings.HasPrefix(v, "container:") {
-			return nil, nil, nil, fmt.Errorf("invalid volume_from: %s", v)
-		}
-		volumesFrom = append(volumesFrom, v[len("container:"):])
-	}
-
-	links, err := s.getLinks(ctx, p.Name, service, number)
+	securityOpts, unconfined, err := parseSecurityOpts(p, service.SecurityOpt)
 	if err != nil {
-		return nil, nil, nil, err
+		return createConfigs{}, err
 	}
 
-	securityOpts, err := parseSecurityOpts(p, service.SecurityOpt)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 	hostConfig := container.HostConfig{
-		AutoRemove:     autoRemove,
+		AutoRemove:     opts.AutoRemove,
 		Binds:          binds,
 		Mounts:         mounts,
 		CapAdd:         strslice.StrSlice(service.CapAdd),
 		CapDrop:        strslice.StrSlice(service.CapDrop),
-		NetworkMode:    container.NetworkMode(service.NetworkMode),
+		NetworkMode:    networkMode,
 		Init:           service.Init,
 		IpcMode:        container.IpcMode(service.Ipc),
+		CgroupnsMode:   container.CgroupnsMode(service.Cgroup),
 		ReadonlyRootfs: service.ReadOnly,
 		RestartPolicy:  getRestartPolicy(service),
 		ShmSize:        int64(service.ShmSize),
@@ -389,6 +303,7 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 		ExtraHosts:     service.ExtraHosts.AsList(),
 		SecurityOpt:    securityOpts,
 		UsernsMode:     container.UsernsMode(service.UserNSMode),
+		UTSMode:        container.UTSMode(service.Uts),
 		Privileged:     service.Privileged,
 		PidMode:        container.PidMode(service.Pid),
 		Tmpfs:          tmpfs,
@@ -400,46 +315,95 @@ func (s *composeService) getCreateOptions(ctx context.Context, p *types.Project,
 		OomScoreAdj:    int(service.OomScoreAdj),
 	}
 
-	return &containerConfig, &hostConfig, networkConfig, nil
+	if unconfined {
+		hostConfig.MaskedPaths = []string{}
+		hostConfig.ReadonlyPaths = []string{}
+	}
+
+	cfgs := createConfigs{
+		Container: &containerConfig,
+		Host:      &hostConfig,
+		Network:   networkingConfig,
+		Links:     links,
+	}
+	return cfgs, nil
+}
+
+func getAliases(project *types.Project, service types.ServiceConfig, serviceIndex int, networkKey string, useNetworkAliases bool) []string {
+	aliases := []string{getContainerName(project.Name, service, serviceIndex)}
+	if useNetworkAliases {
+		aliases = append(aliases, service.Name)
+		if cfg := service.Networks[networkKey]; cfg != nil {
+			aliases = append(aliases, cfg.Aliases...)
+		}
+	}
+	return aliases
+}
+
+func createEndpointSettings(p *types.Project, service types.ServiceConfig, serviceIndex int, networkKey string, links []string, useNetworkAliases bool) *network.EndpointSettings {
+	config := service.Networks[networkKey]
+	var ipam *network.EndpointIPAMConfig
+	var (
+		ipv4Address string
+		ipv6Address string
+	)
+	if config != nil {
+		ipv4Address = config.Ipv4Address
+		ipv6Address = config.Ipv6Address
+		ipam = &network.EndpointIPAMConfig{
+			IPv4Address:  ipv4Address,
+			IPv6Address:  ipv6Address,
+			LinkLocalIPs: config.LinkLocalIPs,
+		}
+	}
+	return &network.EndpointSettings{
+		Aliases:     getAliases(p, service, serviceIndex, networkKey, useNetworkAliases),
+		Links:       links,
+		IPAddress:   ipv4Address,
+		IPv6Gateway: ipv6Address,
+		IPAMConfig:  ipam,
+	}
 }
 
 // copy/pasted from https://github.com/docker/cli/blob/9de1b162f/cli/command/container/opts.go#L673-L697 + RelativePath
 // TODO find so way to share this code with docker/cli
-func parseSecurityOpts(p *types.Project, securityOpts []string) ([]string, error) {
-	for key, opt := range securityOpts {
+func parseSecurityOpts(p *types.Project, securityOpts []string) ([]string, bool, error) {
+	var (
+		unconfined bool
+		parsed     []string
+	)
+	for _, opt := range securityOpts {
+		if opt == "systempaths=unconfined" {
+			unconfined = true
+			continue
+		}
 		con := strings.SplitN(opt, "=", 2)
 		if len(con) == 1 && con[0] != "no-new-privileges" {
 			if strings.Contains(opt, ":") {
 				con = strings.SplitN(opt, ":", 2)
 			} else {
-				return securityOpts, errors.Errorf("Invalid security-opt: %q", opt)
+				return securityOpts, false, errors.Errorf("Invalid security-opt: %q", opt)
 			}
 		}
 		if con[0] == "seccomp" && con[1] != "unconfined" {
 			f, err := os.ReadFile(p.RelativePath(con[1]))
 			if err != nil {
-				return securityOpts, errors.Errorf("opening seccomp profile (%s) failed: %v", con[1], err)
+				return securityOpts, false, errors.Errorf("opening seccomp profile (%s) failed: %v", con[1], err)
 			}
 			b := bytes.NewBuffer(nil)
 			if err := json.Compact(b, f); err != nil {
-				return securityOpts, errors.Errorf("compacting json for seccomp profile (%s) failed: %v", con[1], err)
+				return securityOpts, false, errors.Errorf("compacting json for seccomp profile (%s) failed: %v", con[1], err)
 			}
-			securityOpts[key] = fmt.Sprintf("seccomp=%s", b.Bytes())
+			parsed = append(parsed, fmt.Sprintf("seccomp=%s", b.Bytes()))
+		} else {
+			parsed = append(parsed, opt)
 		}
 	}
 
-	return securityOpts, nil
+	return parsed, unconfined, nil
 }
 
-func (s *composeService) prepareLabels(service types.ServiceConfig, number int) (map[string]string, error) {
-	labels := map[string]string{}
-	for k, v := range service.Labels {
-		labels[k] = v
-	}
-	for k, v := range service.CustomLabels {
-		labels[k] = v
-	}
-
+func (s *composeService) prepareLabels(labels types.Labels, service types.ServiceConfig, number int) (map[string]string, error) {
 	hash, err := ServiceHash(service)
 	if err != nil {
 		return nil, err
@@ -450,23 +414,45 @@ func (s *composeService) prepareLabels(service types.ServiceConfig, number int) 
 
 	var dependencies []string
 	for s, d := range service.DependsOn {
-		dependencies = append(dependencies, s+":"+d.Condition)
+		dependencies = append(dependencies, fmt.Sprintf("%s:%s:%t", s, d.Condition, d.Restart))
 	}
 	labels[api.DependenciesLabel] = strings.Join(dependencies, ",")
 	return labels, nil
 }
 
-func getDefaultNetworkMode(project *types.Project, service types.ServiceConfig) string {
+// defaultNetworkSettings determines the container.NetworkMode and corresponding network.NetworkingConfig (nil if not applicable).
+func defaultNetworkSettings(
+	project *types.Project,
+	service types.ServiceConfig,
+	serviceIndex int,
+	links []string,
+	useNetworkAliases bool,
+) (container.NetworkMode, *network.NetworkingConfig) {
+	if service.NetworkMode != "" {
+		return container.NetworkMode(service.NetworkMode), nil
+	}
+
 	if len(project.Networks) == 0 {
-		return "none"
+		return "none", nil
 	}
 
+	var networkKey string
 	if len(service.Networks) > 0 {
-		name := service.NetworksByPriority()[0]
-		return project.Networks[name].Name
+		networkKey = service.NetworksByPriority()[0]
+	} else {
+		networkKey = "default"
 	}
-
-	return project.Networks["default"].Name
+	mobyNetworkName := project.Networks[networkKey].Name
+	epSettings := createEndpointSettings(project, service, serviceIndex, networkKey, links, useNetworkAliases)
+	networkConfig := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			mobyNetworkName: epSettings,
+		},
+	}
+	// From the Engine API docs:
+	// > Supported standard values are: bridge, host, none, and container:<name|id>.
+	// > Any other value is taken as a custom network's name to which this container should connect to.
+	return container.NetworkMode(mobyNetworkName), networkConfig
 }
 
 func getRestartPolicy(service types.ServiceConfig) container.RestartPolicy {
@@ -622,8 +608,8 @@ func setLimits(limits *types.Resource, resources *container.Resources) {
 			resources.NanoCPUs = int64(f * 1e9)
 		}
 	}
-	if limits.PIds > 0 {
-		resources.PidsLimit = &limits.PIds
+	if limits.Pids > 0 {
+		resources.PidsLimit = &limits.Pids
 	}
 }
 
@@ -641,25 +627,25 @@ func setBlkio(blkio *types.BlkioConfig, resources *container.Resources) {
 	for _, b := range blkio.DeviceReadBps {
 		resources.BlkioDeviceReadBps = append(resources.BlkioDeviceReadBps, &blkiodev.ThrottleDevice{
 			Path: b.Path,
-			Rate: b.Rate,
+			Rate: uint64(b.Rate),
 		})
 	}
 	for _, b := range blkio.DeviceReadIOps {
 		resources.BlkioDeviceReadIOps = append(resources.BlkioDeviceReadIOps, &blkiodev.ThrottleDevice{
 			Path: b.Path,
-			Rate: b.Rate,
+			Rate: uint64(b.Rate),
 		})
 	}
 	for _, b := range blkio.DeviceWriteBps {
 		resources.BlkioDeviceWriteBps = append(resources.BlkioDeviceWriteBps, &blkiodev.ThrottleDevice{
 			Path: b.Path,
-			Rate: b.Rate,
+			Rate: uint64(b.Rate),
 		})
 	}
 	for _, b := range blkio.DeviceWriteIOps {
 		resources.BlkioDeviceWriteIOps = append(resources.BlkioDeviceWriteIOps, &blkiodev.ThrottleDevice{
 			Path: b.Path,
-			Rate: b.Rate,
+			Rate: uint64(b.Rate),
 		})
 	}
 }
@@ -725,7 +711,10 @@ func getVolumesFrom(project *types.Project, volumesFrom []string) ([]string, []s
 }
 
 func getDependentServiceFromMode(mode string) string {
-	if strings.HasPrefix(mode, types.NetworkModeServicePrefix) {
+	if strings.HasPrefix(
+		mode,
+		types.NetworkModeServicePrefix,
+	) {
 		return mode[len(types.NetworkModeServicePrefix):]
 	}
 	return ""
@@ -874,7 +863,7 @@ func buildContainerConfigMounts(p types.Project, s types.ServiceConfig) ([]mount
 		target := config.Target
 		if config.Target == "" {
 			target = configsBaseDir + config.Source
-		} else if !isUnixAbs(config.Target) {
+		} else if !isAbsTarget(config.Target) {
 			target = configsBaseDir + config.Target
 		}
 
@@ -909,7 +898,7 @@ func buildContainerSecretMounts(p types.Project, s types.ServiceConfig) ([]mount
 		target := secret.Target
 		if secret.Target == "" {
 			target = secretsDir + secret.Source
-		} else if !isUnixAbs(secret.Target) {
+		} else if !isAbsTarget(secret.Target) {
 			target = secretsDir + secret.Target
 		}
 
@@ -940,8 +929,22 @@ func buildContainerSecretMounts(p types.Project, s types.ServiceConfig) ([]mount
 	return values, nil
 }
 
+func isAbsTarget(p string) bool {
+	return isUnixAbs(p) || isWindowsAbs(p)
+}
+
 func isUnixAbs(p string) bool {
 	return strings.HasPrefix(p, "/")
+}
+
+func isWindowsAbs(p string) bool {
+	if strings.HasPrefix(p, "\\\\") {
+		return true
+	}
+	if len(p) > 2 && p[1] == ':' {
+		return p[2] == '\\'
+	}
+	return false
 }
 
 func buildMount(project types.Project, volume types.ServiceVolumeConfig) (mount.Mount, error) {
@@ -1051,15 +1054,133 @@ func buildTmpfsOptions(tmpfs *types.ServiceVolumeTmpfs) *mount.TmpfsOptions {
 	}
 }
 
-func getAliases(s types.ServiceConfig, c *types.ServiceNetworkConfig) []string {
-	aliases := []string{s.Name}
-	if c != nil {
-		aliases = append(aliases, c.Aliases...)
+func (s *composeService) ensureNetwork(ctx context.Context, n *types.NetworkConfig) error {
+	if n.External.External {
+		return s.resolveExternalNetwork(ctx, n)
 	}
-	return aliases
+
+	err := s.resolveOrCreateNetwork(ctx, n)
+	if errdefs.IsConflict(err) {
+		// Maybe another execution of `docker compose up|run` created same network
+		// let's retry once
+		return s.resolveOrCreateNetwork(ctx, n)
+	}
+	return err
 }
 
-func (s *composeService) ensureNetwork(ctx context.Context, n types.NetworkConfig) error {
+func (s *composeService) resolveOrCreateNetwork(ctx context.Context, n *types.NetworkConfig) error { //nolint:gocyclo
+	expectedNetworkLabel := n.Labels[api.NetworkLabel]
+	expectedProjectLabel := n.Labels[api.ProjectLabel]
+
+	// First, try to find a unique network matching by name or ID
+	inspect, err := s.apiClient().NetworkInspect(ctx, n.Name, moby.NetworkInspectOptions{})
+	if err == nil {
+		// NetworkInspect will match on ID prefix, so double check we get the expected one
+		// as looking for network named `db` we could erroneously matched network ID `db9086999caf`
+		if inspect.Name == n.Name || inspect.ID == n.Name {
+			p, ok := inspect.Labels[api.ProjectLabel]
+			if !ok {
+				logrus.Warnf("a network with name %s exists but was not created by compose.\n"+
+					"Set `external: true` to use an existing network", n.Name)
+			} else if p != expectedProjectLabel {
+				logrus.Warnf("a network with name %s exists but was not created for project %q.\n"+
+					"Set `external: true` to use an existing network", n.Name, expectedProjectLabel)
+			}
+			if inspect.Labels[api.NetworkLabel] != expectedNetworkLabel {
+				return fmt.Errorf("network %s was found but has incorrect label %s set to %q", n.Name, api.NetworkLabel, inspect.Labels[api.NetworkLabel])
+			}
+			return nil
+		}
+	}
+	// ignore other errors. Typically, an ambiguous request by name results in some generic `invalidParameter` error
+
+	// Either not found, or name is ambiguous - use NetworkList to list by name
+	networks, err := s.apiClient().NetworkList(ctx, moby.NetworkListOptions{
+		Filters: filters.NewArgs(filters.Arg("name", n.Name)),
+	})
+	if err != nil {
+		return err
+	}
+
+	// NetworkList Matches all or part of a network name, so we have to filter for a strict match
+	networks = utils.Filter(networks, func(net moby.NetworkResource) bool {
+		return net.Name == n.Name
+	})
+
+	for _, net := range networks {
+		if net.Labels[api.ProjectLabel] == expectedProjectLabel &&
+			net.Labels[api.NetworkLabel] == expectedNetworkLabel {
+			return nil
+		}
+	}
+
+	// we could have set NetworkList with a projectFilter and networkFilter but not doing so allows to catch this
+	// scenario were a network with same name exists but doesn't have label, and use of `CheckDuplicate: true`
+	// prevents to create another one.
+	if len(networks) > 0 {
+		logrus.Warnf("a network with name %s exists but was not created by compose.\n"+
+			"Set `external: true` to use an existing network", n.Name)
+		return nil
+	}
+
+	var ipam *network.IPAM
+	if n.Ipam.Config != nil {
+		var config []network.IPAMConfig
+		for _, pool := range n.Ipam.Config {
+			config = append(config, network.IPAMConfig{
+				Subnet:     pool.Subnet,
+				IPRange:    pool.IPRange,
+				Gateway:    pool.Gateway,
+				AuxAddress: pool.AuxiliaryAddresses,
+			})
+		}
+		ipam = &network.IPAM{
+			Driver: n.Ipam.Driver,
+			Config: config,
+		}
+	}
+	createOpts := moby.NetworkCreate{
+		CheckDuplicate: true,
+		Labels:         n.Labels,
+		Driver:         n.Driver,
+		Options:        n.DriverOpts,
+		Internal:       n.Internal,
+		Attachable:     n.Attachable,
+		IPAM:           ipam,
+		EnableIPv6:     n.EnableIPv6,
+	}
+
+	if n.Ipam.Driver != "" || len(n.Ipam.Config) > 0 {
+		createOpts.IPAM = &network.IPAM{}
+	}
+
+	if n.Ipam.Driver != "" {
+		createOpts.IPAM.Driver = n.Ipam.Driver
+	}
+
+	for _, ipamConfig := range n.Ipam.Config {
+		config := network.IPAMConfig{
+			Subnet:     ipamConfig.Subnet,
+			IPRange:    ipamConfig.IPRange,
+			Gateway:    ipamConfig.Gateway,
+			AuxAddress: ipamConfig.AuxiliaryAddresses,
+		}
+		createOpts.IPAM.Config = append(createOpts.IPAM.Config, config)
+	}
+	networkEventName := fmt.Sprintf("Network %s", n.Name)
+	w := progress.ContextWriter(ctx)
+	w.Event(progress.CreatingEvent(networkEventName))
+
+	_, err = s.apiClient().NetworkCreate(ctx, n.Name, createOpts)
+	if err != nil {
+		w.Event(progress.ErrorEvent(networkEventName))
+		return errors.Wrapf(err, "failed to create network %s", n.Name)
+	}
+	w.Event(progress.CreatedEvent(networkEventName))
+	return nil
+}
+
+func (s *composeService) resolveExternalNetwork(ctx context.Context, n *types.NetworkConfig) error {
 	// NetworkInspect will match on ID prefix, so NetworkList with a name
 	// filter is used to look for an exact match to prevent e.g. a network
 	// named `db` from getting erroneously matched to a network with an ID
@@ -1070,81 +1191,35 @@ func (s *composeService) ensureNetwork(ctx context.Context, n types.NetworkConfi
 	if err != nil {
 		return err
 	}
-	networkNotFound := true
-	for _, net := range networks {
-		if net.Name == n.Name {
-			networkNotFound = false
-			break
-		}
-	}
-	if networkNotFound {
-		if n.External.External {
-			if n.Driver == "overlay" {
-				// Swarm nodes do not register overlay networks that were
-				// created on a different node unless they're in use.
-				// Here we assume `driver` is relevant for a network we don't manage
-				// which is a non-sense, but this is our legacy ¯\(ツ)/¯
-				// networkAttach will later fail anyway if network actually doesn't exists
+
+	// NetworkList API doesn't return the exact name match, so we can retrieve more than one network with a request
+	networks = utils.Filter(networks, func(net moby.NetworkResource) bool {
+		return net.Name == n.Name
+	})
+
+	switch len(networks) {
+	case 1:
+		n.Name = networks[0].ID
+		return nil
+	case 0:
+		if n.Driver == "overlay" {
+			// Swarm nodes do not register overlay networks that were
+			// created on a different node unless they're in use.
+			// Here we assume `driver` is relevant for a network we don't manage
+			// which is a non-sense, but this is our legacy ¯\(ツ)/¯
+			// networkAttach will later fail anyway if network actually doesn't exists
+			enabled, err := s.isSWarmEnabled(ctx)
+			if err != nil {
+				return err
+			}
+			if enabled {
 				return nil
 			}
-			return fmt.Errorf("network %s declared as external, but could not be found", n.Name)
 		}
-		var ipam *network.IPAM
-		if n.Ipam.Config != nil {
-			var config []network.IPAMConfig
-			for _, pool := range n.Ipam.Config {
-				config = append(config, network.IPAMConfig{
-					Subnet:     pool.Subnet,
-					IPRange:    pool.IPRange,
-					Gateway:    pool.Gateway,
-					AuxAddress: pool.AuxiliaryAddresses,
-				})
-			}
-			ipam = &network.IPAM{
-				Driver: n.Ipam.Driver,
-				Config: config,
-			}
-		}
-		createOpts := moby.NetworkCreate{
-			CheckDuplicate: true,
-			// TODO NameSpace Labels
-			Labels:     n.Labels,
-			Driver:     n.Driver,
-			Options:    n.DriverOpts,
-			Internal:   n.Internal,
-			Attachable: n.Attachable,
-			IPAM:       ipam,
-			EnableIPv6: n.EnableIPv6,
-		}
-
-		if n.Ipam.Driver != "" || len(n.Ipam.Config) > 0 {
-			createOpts.IPAM = &network.IPAM{}
-		}
-
-		if n.Ipam.Driver != "" {
-			createOpts.IPAM.Driver = n.Ipam.Driver
-		}
-
-		for _, ipamConfig := range n.Ipam.Config {
-			config := network.IPAMConfig{
-				Subnet:     ipamConfig.Subnet,
-				IPRange:    ipamConfig.IPRange,
-				Gateway:    ipamConfig.Gateway,
-				AuxAddress: ipamConfig.AuxiliaryAddresses,
-			}
-			createOpts.IPAM.Config = append(createOpts.IPAM.Config, config)
-		}
-		networkEventName := fmt.Sprintf("Network %s", n.Name)
-		w := progress.ContextWriter(ctx)
-		w.Event(progress.CreatingEvent(networkEventName))
-		if _, err := s.apiClient().NetworkCreate(ctx, n.Name, createOpts); err != nil {
-			w.Event(progress.ErrorEvent(networkEventName))
-			return errors.Wrapf(err, "failed to create network %s", n.Name)
-		}
-		w.Event(progress.CreatedEvent(networkEventName))
-		return nil
+		return fmt.Errorf("network %s declared as external, but could not be found", n.Name)
+	default:
+		return fmt.Errorf("multiple networks with name %q were found. Use network ID as `name` to avoid ambiguity", n.Name)
 	}
-	return nil
 }
 
 func (s *composeService) ensureVolume(ctx context.Context, volume types.VolumeConfig, project string) error {
@@ -1170,7 +1245,7 @@ func (s *composeService) ensureVolume(ctx context.Context, volume types.VolumeCo
 		logrus.Warnf("volume %q already exists but was not created by Docker Compose. Use `external: true` to use an existing volume", volume.Name)
 	}
 	if ok && p != project {
-		logrus.Warnf("volume %q already exists but was not created for project %q. Use `external: true` to use an existing volume", volume.Name, p)
+		logrus.Warnf("volume %q already exists but was created for project %q (expected %q). Use `external: true` to use an existing volume", volume.Name, p, project)
 	}
 	return nil
 }

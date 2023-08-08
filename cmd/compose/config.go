@@ -17,11 +17,9 @@
 package compose
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strings"
@@ -34,14 +32,15 @@ import (
 	"github.com/docker/compose/v2/pkg/compose"
 )
 
-type convertOptions struct {
-	*projectOptions
+type configOptions struct {
+	*ProjectOptions
 	Format              string
 	Output              string
 	quiet               bool
 	resolveImageDigests bool
 	noInterpolate       bool
 	noNormalize         bool
+	noResolvePath       bool
 	services            bool
 	volumes             bool
 	profiles            bool
@@ -50,14 +49,24 @@ type convertOptions struct {
 	noConsistency       bool
 }
 
-func convertCommand(p *projectOptions, backend api.Service) *cobra.Command {
-	opts := convertOptions{
-		projectOptions: p,
+func (o *configOptions) ToProject(services []string) (*types.Project, error) {
+	return o.ProjectOptions.ToProject(services,
+		cli.WithInterpolation(!o.noInterpolate),
+		cli.WithResolvedPaths(!o.noResolvePath),
+		cli.WithNormalization(!o.noNormalize),
+		cli.WithConsistency(!o.noConsistency),
+		cli.WithProfiles(o.Profiles),
+		cli.WithDiscardEnvFile)
+}
+
+func configCommand(p *ProjectOptions, streams api.Streams, backend api.Service) *cobra.Command {
+	opts := configOptions{
+		ProjectOptions: p,
 	}
 	cmd := &cobra.Command{
-		Aliases: []string{"config"},
-		Use:     "convert [OPTIONS] [SERVICE...]",
-		Short:   "Converts the compose file to platform's canonical format",
+		Aliases: []string{"convert"}, // for backward compatibility with Cloud integrations
+		Use:     "config [OPTIONS] [SERVICE...]",
+		Short:   "Parse, resolve and render compose file in canonical format",
 		PreRunE: Adapt(func(ctx context.Context, args []string) error {
 			if opts.quiet {
 				devnull, err := os.Open(os.DevNull)
@@ -73,22 +82,22 @@ func convertCommand(p *projectOptions, backend api.Service) *cobra.Command {
 		}),
 		RunE: Adapt(func(ctx context.Context, args []string) error {
 			if opts.services {
-				return runServices(opts)
+				return runServices(streams, opts)
 			}
 			if opts.volumes {
-				return runVolumes(opts)
+				return runVolumes(streams, opts)
 			}
 			if opts.hash != "" {
-				return runHash(opts)
+				return runHash(streams, opts)
 			}
 			if opts.profiles {
-				return runProfiles(opts, args)
+				return runProfiles(streams, opts, args)
 			}
 			if opts.images {
-				return runConfigImages(opts, args)
+				return runConfigImages(streams, opts, args)
 			}
 
-			return runConvert(ctx, backend, opts, args)
+			return runConfig(ctx, streams, backend, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(p),
 	}
@@ -98,6 +107,7 @@ func convertCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	flags.BoolVarP(&opts.quiet, "quiet", "q", false, "Only validate the configuration, don't print anything.")
 	flags.BoolVar(&opts.noInterpolate, "no-interpolate", false, "Don't interpolate environment variables.")
 	flags.BoolVar(&opts.noNormalize, "no-normalize", false, "Don't normalize compose model.")
+	flags.BoolVar(&opts.noResolvePath, "no-path-resolution", false, "Don't resolve file paths.")
 	flags.BoolVar(&opts.noConsistency, "no-consistency", false, "Don't check model consistency - warning: may produce invalid Compose output")
 
 	flags.BoolVar(&opts.services, "services", false, "Print the service names, one per line.")
@@ -110,20 +120,14 @@ func convertCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	return cmd
 }
 
-func runConvert(ctx context.Context, backend api.Service, opts convertOptions, services []string) error {
+func runConfig(ctx context.Context, streams api.Streams, backend api.Service, opts configOptions, services []string) error {
 	var content []byte
-	project, err := opts.toProject(services,
-		cli.WithInterpolation(!opts.noInterpolate),
-		cli.WithResolvedPaths(true),
-		cli.WithNormalization(!opts.noNormalize),
-		cli.WithConsistency(!opts.noConsistency),
-		cli.WithDiscardEnvFile)
-
+	project, err := opts.ToProject(services)
 	if err != nil {
 		return err
 	}
 
-	content, err = backend.Convert(ctx, project, api.ConvertOptions{
+	content, err = backend.Config(ctx, project, api.ConfigOptions{
 		Format:              opts.Format,
 		Output:              opts.Output,
 		ResolveImageDigests: opts.resolveImageDigests,
@@ -140,62 +144,70 @@ func runConvert(ctx context.Context, backend api.Service, opts convertOptions, s
 		return nil
 	}
 
-	var out io.Writer = os.Stdout
 	if opts.Output != "" && len(content) > 0 {
-		file, err := os.Create(opts.Output)
-		if err != nil {
-			return err
-		}
-		out = bufio.NewWriter(file)
+		return os.WriteFile(opts.Output, content, 0o666)
 	}
-	_, err = fmt.Fprint(out, string(content))
+	_, err = fmt.Fprint(streams.Out(), string(content))
 	return err
 }
 
-func runServices(opts convertOptions) error {
-	project, err := opts.toProject(nil)
+func runServices(streams api.Streams, opts configOptions) error {
+	project, err := opts.ToProject(nil)
 	if err != nil {
 		return err
 	}
 	return project.WithServices(project.ServiceNames(), func(s types.ServiceConfig) error {
-		fmt.Println(s.Name)
+		fmt.Fprintln(streams.Out(), s.Name)
 		return nil
 	})
 }
 
-func runVolumes(opts convertOptions) error {
-	project, err := opts.toProject(nil)
+func runVolumes(streams api.Streams, opts configOptions) error {
+	project, err := opts.ToProject(nil)
 	if err != nil {
 		return err
 	}
 	for n := range project.Volumes {
-		fmt.Println(n)
+		fmt.Fprintln(streams.Out(), n)
 	}
 	return nil
 }
 
-func runHash(opts convertOptions) error {
+func runHash(streams api.Streams, opts configOptions) error {
 	var services []string
 	if opts.hash != "*" {
 		services = append(services, strings.Split(opts.hash, ",")...)
 	}
-	project, err := opts.toProject(services)
+	project, err := opts.ToProject(nil)
 	if err != nil {
 		return err
 	}
-	for _, s := range project.Services {
+
+	if len(services) > 0 {
+		err = project.ForServices(services, types.IgnoreDependencies)
+		if err != nil {
+			return err
+		}
+	}
+
+	sorted := project.Services
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	for _, s := range sorted {
 		hash, err := compose.ServiceHash(s)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s %s\n", s.Name, hash)
+		fmt.Fprintf(streams.Out(), "%s %s\n", s.Name, hash)
 	}
 	return nil
 }
 
-func runProfiles(opts convertOptions, services []string) error {
+func runProfiles(streams api.Streams, opts configOptions, services []string) error {
 	set := map[string]struct{}{}
-	project, err := opts.toProject(services)
+	project, err := opts.ToProject(services)
 	if err != nil {
 		return err
 	}
@@ -210,22 +222,18 @@ func runProfiles(opts convertOptions, services []string) error {
 	}
 	sort.Strings(profiles)
 	for _, p := range profiles {
-		fmt.Println(p)
+		fmt.Fprintln(streams.Out(), p)
 	}
 	return nil
 }
 
-func runConfigImages(opts convertOptions, services []string) error {
-	project, err := opts.toProject(services)
+func runConfigImages(streams api.Streams, opts configOptions, services []string) error {
+	project, err := opts.ToProject(services)
 	if err != nil {
 		return err
 	}
 	for _, s := range project.Services {
-		if s.Image != "" {
-			fmt.Println(s.Image)
-		} else {
-			fmt.Printf("%s%s%s\n", project.Name, api.Separator, s.Name)
-		}
+		fmt.Fprintln(streams.Out(), api.GetImageNameOrDefault(s, project.Name))
 	}
 	return nil
 }

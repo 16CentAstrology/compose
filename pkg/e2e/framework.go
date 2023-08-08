@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,8 +45,11 @@ var (
 	// DockerComposeExecutableName is the OS dependent Docker CLI binary name
 	DockerComposeExecutableName = "docker-" + compose.PluginName
 
-	// DockerScanExecutableName is the OS dependent Docker CLI binary name
+	// DockerScanExecutableName is the OS dependent Docker Scan plugin binary name
 	DockerScanExecutableName = "docker-scan"
+
+	// DockerBuildxExecutableName is the Os dependent Buildx plugin binary name
+	DockerBuildxExecutableName = "docker-buildx"
 
 	// WindowsExecutableSuffix is the Windows executable suffix
 	WindowsExecutableSuffix = ".exe"
@@ -56,6 +60,7 @@ func init() {
 		DockerExecutableName += WindowsExecutableSuffix
 		DockerComposeExecutableName += WindowsExecutableSuffix
 		DockerScanExecutableName += WindowsExecutableSuffix
+		DockerBuildxExecutableName += WindowsExecutableSuffix
 	}
 }
 
@@ -99,7 +104,7 @@ func NewCLI(t testing.TB, opts ...CLIOption) *CLI {
 	for _, opt := range opts {
 		opt(c)
 	}
-
+	c.RunDockerComposeCmdNoCheck(t, "version")
 	return c
 }
 
@@ -130,11 +135,18 @@ func initializePlugins(t testing.TB, configDir string) {
 	require.NoError(t, os.MkdirAll(filepath.Join(configDir, "cli-plugins"), 0o755),
 		"Failed to create cli-plugins directory")
 	composePlugin, err := findExecutable(DockerComposeExecutableName)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		t.Logf("WARNING: docker-compose cli-plugin not found")
 	}
+
 	if err == nil {
 		CopyFile(t, composePlugin, filepath.Join(configDir, "cli-plugins", DockerComposeExecutableName))
+		buildxPlugin, err := findPluginExecutable(DockerBuildxExecutableName)
+		if err != nil {
+			t.Logf("WARNING: docker-buildx cli-plugin not found, using default buildx installation.")
+		} else {
+			CopyFile(t, buildxPlugin, filepath.Join(configDir, "cli-plugins", DockerBuildxExecutableName))
+		}
 		// We don't need a functional scan plugin, but a valid plugin binary
 		CopyFile(t, composePlugin, filepath.Join(configDir, "cli-plugins", DockerScanExecutableName))
 	}
@@ -150,20 +162,37 @@ func dirContents(dir string) []string {
 }
 
 func findExecutable(executableName string) (string, error) {
-	_, filename, _, _ := runtime.Caller(0)
-	root := filepath.Join(filepath.Dir(filename), "..", "..")
-	buildPath := filepath.Join(root, "bin", "build")
-
-	bin, err := filepath.Abs(filepath.Join(buildPath, executableName))
-	if err != nil {
-		return "", err
+	bin := os.Getenv("COMPOSE_E2E_BIN_PATH")
+	if bin == "" {
+		_, filename, _, _ := runtime.Caller(0)
+		buildPath := filepath.Join(filepath.Dir(filename), "..", "..", "bin", "build")
+		var err error
+		bin, err = filepath.Abs(filepath.Join(buildPath, executableName))
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if _, err := os.Stat(bin); err == nil {
 		return bin, nil
 	}
+	return "", fmt.Errorf("looking for %q: %w", bin, fs.ErrNotExist)
+}
 
-	return "", errors.Wrap(os.ErrNotExist, "executable not found")
+func findPluginExecutable(pluginExecutableName string) (string, error) {
+	dockerUserDir := ".docker/cli-plugins"
+	userDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	bin, err := filepath.Abs(filepath.Join(userDir, dockerUserDir, pluginExecutableName))
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(bin); err == nil {
+		return bin, nil
+	}
+	return "", errors.Wrap(os.ErrNotExist, fmt.Sprintf("plugin not found %s", pluginExecutableName))
 }
 
 // CopyFile copies a file from a sourceFile to a destinationFile setting permissions to 0755
@@ -187,12 +216,19 @@ func CopyFile(t testing.TB, sourceFile string, destinationFile string) {
 // BaseEnvironment provides the minimal environment variables used across all
 // Docker / Compose commands.
 func (c *CLI) BaseEnvironment() []string {
-	return []string{
+	env := []string{
 		"HOME=" + c.HomeDir,
 		"USER=" + os.Getenv("USER"),
 		"DOCKER_CONFIG=" + c.ConfigDir,
 		"KUBECONFIG=invalid",
 	}
+	if coverdir, ok := os.LookupEnv("GOCOVERDIR"); ok {
+		_, filename, _, _ := runtime.Caller(0)
+		root := filepath.Join(filepath.Dir(filename), "..", "..")
+		coverdir = filepath.Join(root, coverdir)
+		env = append(env, fmt.Sprintf("GOCOVERDIR=%s", coverdir))
+	}
+	return env
 }
 
 // NewCmd creates a cmd object configured with the test environment set
@@ -278,7 +314,10 @@ func (c *CLI) RunDockerComposeCmd(t testing.TB, args ...string) *icmd.Result {
 // RunDockerComposeCmdNoCheck runs a docker compose command, don't presume of any expectation and returns a result
 func (c *CLI) RunDockerComposeCmdNoCheck(t testing.TB, args ...string) *icmd.Result {
 	t.Helper()
-	return icmd.RunCmd(c.NewDockerComposeCmd(t, args...))
+	cmd := c.NewDockerComposeCmd(t, args...)
+	cmd.Stdout = os.Stdout
+	t.Logf("Running command: %s", strings.Join(cmd.Command, " "))
+	return icmd.RunCmd(cmd)
 }
 
 // NewDockerComposeCmd creates a command object for Compose, either in plugin

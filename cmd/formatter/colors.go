@@ -18,10 +18,10 @@ package formatter
 
 import (
 	"fmt"
-	"os"
 	"strconv"
+	"sync"
 
-	"github.com/mattn/go-isatty"
+	"github.com/docker/compose/v2/pkg/api"
 )
 
 var names = []string{
@@ -47,20 +47,20 @@ const (
 )
 
 // SetANSIMode configure formatter for colored output on ANSI-compliant console
-func SetANSIMode(ansi string) {
-	if !useAnsi(ansi) {
+func SetANSIMode(streams api.Streams, ansi string) {
+	if !useAnsi(streams, ansi) {
 		nextColor = func() colorFunc {
 			return monochrome
 		}
 	}
 }
 
-func useAnsi(ansi string) bool {
+func useAnsi(streams api.Streams, ansi string) bool {
 	switch ansi {
 	case Always:
 		return true
 	case Auto:
-		return isatty.IsTerminal(os.Stdout.Fd())
+		return streams.Out().IsTerminal()
 	}
 	return false
 }
@@ -87,12 +87,17 @@ func makeColorFunc(code string) colorFunc {
 }
 
 var nextColor = rainbowColor
+var rainbow []colorFunc
+var currentIndex = 0
+var mutex sync.Mutex
 
 func rainbowColor() colorFunc {
-	return <-loop
+	mutex.Lock()
+	defer mutex.Unlock()
+	result := rainbow[currentIndex]
+	currentIndex = (currentIndex + 1) % len(rainbow)
+	return result
 }
-
-var loop = make(chan colorFunc)
 
 func init() {
 	colors := map[string]colorFunc{}
@@ -100,25 +105,16 @@ func init() {
 		colors[name] = makeColorFunc(strconv.Itoa(30 + i))
 		colors["intense_"+name] = makeColorFunc(strconv.Itoa(30+i) + ";1")
 	}
-
-	go func() {
-		i := 0
-		rainbow := []colorFunc{
-			colors["cyan"],
-			colors["yellow"],
-			colors["green"],
-			colors["magenta"],
-			colors["blue"],
-			colors["intense_cyan"],
-			colors["intense_yellow"],
-			colors["intense_green"],
-			colors["intense_magenta"],
-			colors["intense_blue"],
-		}
-
-		for {
-			loop <- rainbow[i]
-			i = (i + 1) % len(rainbow)
-		}
-	}()
+	rainbow = []colorFunc{
+		colors["cyan"],
+		colors["yellow"],
+		colors["green"],
+		colors["magenta"],
+		colors["blue"],
+		colors["intense_cyan"],
+		colors["intense_yellow"],
+		colors["intense_green"],
+		colors["intense_magenta"],
+		colors["intense_blue"],
+	}
 }

@@ -17,7 +17,6 @@
 package compose
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/docker/compose/v2/pkg/api"
@@ -26,7 +25,7 @@ import (
 // logPrinter watch application containers an collect their logs
 type logPrinter interface {
 	HandleEvent(event api.ContainerEvent)
-	Run(ctx context.Context, cascadeStop bool, exitCodeFrom string, stopFn func() error) (int, error)
+	Run(cascadeStop bool, exitCodeFrom string, stopFn func() error) (int, error)
 	Cancel()
 	Stop()
 }
@@ -64,7 +63,7 @@ func (p *printer) HandleEvent(event api.ContainerEvent) {
 }
 
 //nolint:gocyclo
-func (p *printer) Run(ctx context.Context, cascadeStop bool, exitCodeFrom string, stopFn func() error) (int, error) {
+func (p *printer) Run(cascadeStop bool, exitCodeFrom string, stopFn func() error) (int, error) {
 	var (
 		aborting bool
 		exitCode int
@@ -74,30 +73,30 @@ func (p *printer) Run(ctx context.Context, cascadeStop bool, exitCodeFrom string
 		select {
 		case <-p.stopCh:
 			return exitCode, nil
-		case <-ctx.Done():
-			return exitCode, ctx.Err()
 		case event := <-p.queue:
-			container := event.Container
+			container, id := event.Container, event.ID
 			switch event.Type {
 			case api.UserCancel:
 				aborting = true
 			case api.ContainerEventAttach:
-				if _, ok := containers[container]; ok {
+				if _, ok := containers[id]; ok {
 					continue
 				}
-				containers[container] = struct{}{}
+				containers[id] = struct{}{}
 				p.consumer.Register(container)
-			case api.ContainerEventExit, api.ContainerEventStopped:
+			case api.ContainerEventExit, api.ContainerEventStopped, api.ContainerEventRecreated:
 				if !event.Restarting {
-					delete(containers, container)
+					delete(containers, id)
 				}
 				if !aborting {
 					p.consumer.Status(container, fmt.Sprintf("exited with code %d", event.ExitCode))
+					if event.Type == api.ContainerEventRecreated {
+						p.consumer.Status(container, "has been recreated")
+					}
 				}
 				if cascadeStop {
 					if !aborting {
 						aborting = true
-						fmt.Println("Aborting on container exit...")
 						err := stopFn()
 						if err != nil {
 							return 0, err

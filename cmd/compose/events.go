@@ -31,17 +31,17 @@ type eventsOpts struct {
 	json bool
 }
 
-func eventsCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func eventsCommand(p *ProjectOptions, streams api.Streams, backend api.Service) *cobra.Command {
 	opts := eventsOpts{
 		composeOptions: &composeOptions{
-			projectOptions: p,
+			ProjectOptions: p,
 		},
 	}
 	cmd := &cobra.Command{
 		Use:   "events [OPTIONS] [SERVICE...]",
 		Short: "Receive real time events from containers.",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runEvents(ctx, backend, opts, args)
+			return runEvents(ctx, streams, backend, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(p),
 	}
@@ -50,7 +50,7 @@ func eventsCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	return cmd
 }
 
-func runEvents(ctx context.Context, backend api.Service, opts eventsOpts, services []string) error {
+func runEvents(ctx context.Context, streams api.Streams, backend api.Service, opts eventsOpts, services []string) error {
 	name, err := opts.toProjectName()
 	if err != nil {
 		return err
@@ -71,9 +71,9 @@ func runEvents(ctx context.Context, backend api.Service, opts eventsOpts, servic
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(marshal))
+				fmt.Fprintln(streams.Out(), string(marshal))
 			} else {
-				fmt.Println(event)
+				fmt.Fprintln(streams.Out(), event)
 			}
 			return nil
 		},

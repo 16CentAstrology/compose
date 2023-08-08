@@ -26,22 +26,22 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/utils"
 )
 
 type pullOptions struct {
-	*projectOptions
+	*ProjectOptions
 	composeOptions
 	quiet              bool
 	parallel           bool
 	noParallel         bool
 	includeDeps        bool
 	ignorePullFailures bool
+	noBuildable        bool
 }
 
-func pullCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func pullCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 	opts := pullOptions{
-		projectOptions: p,
+		ProjectOptions: p,
 	}
 	cmd := &cobra.Command{
 		Use:   "pull [OPTIONS] [SERVICE...]",
@@ -58,46 +58,33 @@ func pullCommand(p *projectOptions, backend api.Service) *cobra.Command {
 		ValidArgsFunction: completeServiceNames(p),
 	}
 	flags := cmd.Flags()
-	flags.BoolVarP(&opts.quiet, "quiet", "q", false, "Pull without printing progress information")
-	cmd.Flags().BoolVar(&opts.includeDeps, "include-deps", false, "Also pull services declared as dependencies")
+	flags.BoolVarP(&opts.quiet, "quiet", "q", false, "Pull without printing progress information.")
+	cmd.Flags().BoolVar(&opts.includeDeps, "include-deps", false, "Also pull services declared as dependencies.")
 	cmd.Flags().BoolVar(&opts.parallel, "parallel", true, "DEPRECATED pull multiple images in parallel.")
 	flags.MarkHidden("parallel") //nolint:errcheck
 	cmd.Flags().BoolVar(&opts.parallel, "no-parallel", true, "DEPRECATED disable parallel pulling.")
 	flags.MarkHidden("no-parallel") //nolint:errcheck
-	cmd.Flags().BoolVar(&opts.ignorePullFailures, "ignore-pull-failures", false, "Pull what it can and ignores images with pull failures")
+	cmd.Flags().BoolVar(&opts.ignorePullFailures, "ignore-pull-failures", false, "Pull what it can and ignores images with pull failures.")
+	cmd.Flags().BoolVar(&opts.noBuildable, "ignore-buildable", false, "Ignore images that can be built.")
 	return cmd
 }
 
-func withSelectedServicesOnly(project *types.Project, services []string) error {
-	enabled, err := project.GetServices(services...)
-	if err != nil {
-		return err
-	}
-	for _, s := range project.Services {
-		if !utils.StringContains(services, s.Name) {
-			project.DisabledServices = append(project.DisabledServices, s)
-		}
-	}
-	project.Services = enabled
-
-	return nil
-}
-
 func runPull(ctx context.Context, backend api.Service, opts pullOptions, services []string) error {
-	project, err := opts.toProject(services)
+	project, err := opts.ToProject(services)
 	if err != nil {
 		return err
 	}
 
 	if !opts.includeDeps {
-		err := withSelectedServicesOnly(project, services)
+		err := project.ForServices(services, types.IgnoreDependencies)
 		if err != nil {
 			return err
 		}
 	}
 
 	return backend.Pull(ctx, project, api.PullOptions{
-		Quiet:          opts.quiet,
-		IgnoreFailures: opts.ignorePullFailures,
+		Quiet:           opts.quiet,
+		IgnoreFailures:  opts.ignorePullFailures,
+		IgnoreBuildable: opts.noBuildable,
 	})
 }

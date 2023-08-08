@@ -17,19 +17,27 @@
 package compose
 
 import (
-	"github.com/moby/buildkit/util/tracing/detect"
-	"go.opentelemetry.io/otel"
+	"testing"
 
-	_ "github.com/moby/buildkit/util/tracing/detect/delegated" //nolint:blank-imports
-	_ "github.com/moby/buildkit/util/tracing/env"              //nolint:blank-imports
+	"github.com/compose-spec/compose-go/types"
+	"gotest.tools/v3/assert"
 )
 
-func init() {
-	detect.ServiceName = "compose"
-	// do not log tracing errors to stdio
-	otel.SetErrorHandler(skipErrors{})
+func TestServiceHash(t *testing.T) {
+	hash1, err := ServiceHash(serviceConfig(1))
+	assert.NilError(t, err)
+	hash2, err := ServiceHash(serviceConfig(2))
+	assert.NilError(t, err)
+	assert.Equal(t, hash1, hash2)
 }
 
-type skipErrors struct{}
-
-func (skipErrors) Handle(err error) {}
+func serviceConfig(replicas uint64) types.ServiceConfig {
+	return types.ServiceConfig{
+		Scale: int(replicas),
+		Deploy: &types.DeployConfig{
+			Replicas: &replicas,
+		},
+		Name:  "foo",
+		Image: "bar",
+	}
+}

@@ -19,13 +19,10 @@ package compose
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
-
-	"github.com/docker/compose/v2/cmd/formatter"
+	"time"
 
 	"github.com/compose-spec/compose-go/types"
+	"github.com/docker/compose/v2/cmd/formatter"
 	"github.com/spf13/cobra"
 
 	"github.com/docker/compose/v2/pkg/api"
@@ -34,7 +31,7 @@ import (
 
 // composeOptions hold options common to `up` and `run` to run compose project
 type composeOptions struct {
-	*projectOptions
+	*ProjectOptions
 }
 
 type upOptions struct {
@@ -44,18 +41,19 @@ type upOptions struct {
 	noDeps             bool
 	cascadeStop        bool
 	exitCodeFrom       string
-	scale              []string
 	noColor            bool
 	noPrefix           bool
 	attachDependencies bool
 	attach             []string
+	noAttach           []string
 	timestamp          bool
 	wait               bool
+	waitTimeout        int
 }
 
 func (opts upOptions) apply(project *types.Project, services []string) error {
 	if opts.noDeps {
-		err := withSelectedServicesOnly(project, services)
+		err := project.ForServices(services, types.IgnoreDependencies)
 		if err != nil {
 			return err
 		}
@@ -68,41 +66,26 @@ func (opts upOptions) apply(project *types.Project, services []string) error {
 		}
 	}
 
-	for _, scale := range opts.scale {
-		split := strings.Split(scale, "=")
-		if len(split) != 2 {
-			return fmt.Errorf("invalid --scale option %q. Should be SERVICE=NUM", scale)
-		}
-		name := split[0]
-		replicas, err := strconv.Atoi(split[1])
-		if err != nil {
-			return err
-		}
-		err = setServiceScale(project, name, uint64(replicas))
-		if err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
-func upCommand(p *projectOptions, backend api.Service) *cobra.Command {
+func upCommand(p *ProjectOptions, streams api.Streams, backend api.Service) *cobra.Command {
 	up := upOptions{}
 	create := createOptions{}
 	upCmd := &cobra.Command{
 		Use:   "up [OPTIONS] [SERVICE...]",
 		Short: "Create and start containers",
 		PreRunE: AdaptCmd(func(ctx context.Context, cmd *cobra.Command, args []string) error {
+			create.pullChanged = cmd.Flags().Changed("pull")
 			create.timeChanged = cmd.Flags().Changed("timeout")
 			return validateFlags(&up, &create)
 		}),
 		RunE: p.WithServices(func(ctx context.Context, project *types.Project, services []string) error {
-			create.ignoreOrphans = utils.StringToBool(project.Environment["COMPOSE_IGNORE_ORPHANS"])
+			create.ignoreOrphans = utils.StringToBool(project.Environment[ComposeIgnoreOrphans])
 			if create.ignoreOrphans && create.removeOrphans {
-				return fmt.Errorf("COMPOSE_IGNORE_ORPHANS and --remove-orphans cannot be combined")
+				return fmt.Errorf("%s and --remove-orphans cannot be combined", ComposeIgnoreOrphans)
 			}
-			return runUp(ctx, backend, create, up, project, services)
+			return runUp(ctx, streams, backend, create, up, project, services)
 		}),
 		ValidArgsFunction: completeServiceNames(p),
 	}
@@ -112,7 +95,7 @@ func upCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	flags.BoolVar(&create.noBuild, "no-build", false, "Don't build an image, even if it's missing.")
 	flags.StringVar(&create.Pull, "pull", "missing", `Pull image before running ("always"|"missing"|"never")`)
 	flags.BoolVar(&create.removeOrphans, "remove-orphans", false, "Remove containers for services not defined in the Compose file.")
-	flags.StringArrayVar(&up.scale, "scale", []string{}, "Scale SERVICE to NUM instances. Overrides the `scale` setting in the Compose file if present.")
+	flags.StringArrayVar(&create.scale, "scale", []string{}, "Scale SERVICE to NUM instances. Overrides the `scale` setting in the Compose file if present.")
 	flags.BoolVar(&up.noColor, "no-color", false, "Produce monochrome output.")
 	flags.BoolVar(&up.noPrefix, "no-log-prefix", false, "Don't print prefix in logs.")
 	flags.BoolVar(&create.forceRecreate, "force-recreate", false, "Recreate containers even if their configuration and image haven't changed.")
@@ -120,7 +103,7 @@ func upCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	flags.BoolVar(&up.noStart, "no-start", false, "Don't start the services after creating them.")
 	flags.BoolVar(&up.cascadeStop, "abort-on-container-exit", false, "Stops all containers if any container was stopped. Incompatible with -d")
 	flags.StringVar(&up.exitCodeFrom, "exit-code-from", "", "Return the exit code of the selected service container. Implies --abort-on-container-exit")
-	flags.IntVarP(&create.timeout, "timeout", "t", 10, "Use this timeout in seconds for container shutdown when attached or when containers are already running.")
+	flags.IntVarP(&create.timeout, "timeout", "t", 0, "Use this timeout in seconds for container shutdown when attached or when containers are already running.")
 	flags.BoolVar(&up.timestamp, "timestamps", false, "Show timestamps.")
 	flags.BoolVar(&up.noDeps, "no-deps", false, "Don't start linked services.")
 	flags.BoolVar(&create.recreateDeps, "always-recreate-deps", false, "Recreate dependent containers. Incompatible with --no-recreate.")
@@ -128,7 +111,9 @@ func upCommand(p *projectOptions, backend api.Service) *cobra.Command {
 	flags.BoolVar(&up.attachDependencies, "attach-dependencies", false, "Attach to dependent containers.")
 	flags.BoolVar(&create.quietPull, "quiet-pull", false, "Pull without printing progress information.")
 	flags.StringArrayVar(&up.attach, "attach", []string{}, "Attach to service output.")
+	flags.StringArrayVar(&up.noAttach, "no-attach", []string{}, "Don't attach to specified service.")
 	flags.BoolVar(&up.wait, "wait", false, "Wait for services to be running|healthy. Implies detached mode.")
+	flags.IntVar(&up.waitTimeout, "wait-timeout", 0, "timeout waiting for application to be running|healthy.")
 
 	return upCmd
 }
@@ -158,33 +143,51 @@ func validateFlags(up *upOptions, create *createOptions) error {
 	return nil
 }
 
-func runUp(ctx context.Context, backend api.Service, createOptions createOptions, upOptions upOptions, project *types.Project, services []string) error {
+func runUp(ctx context.Context, streams api.Streams, backend api.Service, createOptions createOptions, upOptions upOptions, project *types.Project, services []string) error {
 	if len(project.Services) == 0 {
 		return fmt.Errorf("no service selected")
 	}
 
-	createOptions.Apply(project)
+	err := createOptions.Apply(project)
+	if err != nil {
+		return err
+	}
 
-	err := upOptions.apply(project, services)
+	err = upOptions.apply(project, services)
 	if err != nil {
 		return err
 	}
 
 	var consumer api.LogConsumer
 	if !upOptions.Detach {
-		consumer = formatter.NewLogConsumer(ctx, os.Stdout, os.Stderr, !upOptions.noColor, !upOptions.noPrefix, upOptions.timestamp)
+		consumer = formatter.NewLogConsumer(ctx, streams.Out(), streams.Err(), !upOptions.noColor, !upOptions.noPrefix, upOptions.timestamp)
 	}
 
-	attachTo := services
+	attachTo := utils.Set[string]{}
 	if len(upOptions.attach) > 0 {
-		attachTo = upOptions.attach
+		attachTo.AddAll(upOptions.attach...)
 	}
 	if upOptions.attachDependencies {
-		attachTo = project.ServiceNames()
+		if err := project.WithServices(attachTo.Elements(), func(s types.ServiceConfig) error {
+			if s.Attach == nil || *s.Attach {
+				attachTo.Add(s.Name)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	if len(attachTo) == 0 {
-		attachTo = project.ServiceNames()
+		if err := project.WithServices(services, func(s types.ServiceConfig) error {
+			if s.Attach == nil || *s.Attach {
+				attachTo.Add(s.Name)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
+	attachTo.RemoveAll(upOptions.noAttach...)
 
 	create := api.CreateOptions{
 		Services:             services,
@@ -201,15 +204,18 @@ func runUp(ctx context.Context, backend api.Service, createOptions createOptions
 		return backend.Create(ctx, project, create)
 	}
 
+	timeout := time.Duration(upOptions.waitTimeout) * time.Second
+
 	return backend.Up(ctx, project, api.UpOptions{
 		Create: create,
 		Start: api.StartOptions{
 			Project:      project,
 			Attach:       consumer,
-			AttachTo:     attachTo,
+			AttachTo:     attachTo.Elements(),
 			ExitCodeFrom: upOptions.exitCodeFrom,
 			CascadeStop:  upOptions.cascadeStop,
 			Wait:         upOptions.wait,
+			WaitTimeout:  timeout,
 			Services:     services,
 		},
 	})

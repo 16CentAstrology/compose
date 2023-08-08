@@ -23,6 +23,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/docker/compose/v2/internal/tracing"
+
 	"github.com/compose-spec/compose-go/types"
 	"github.com/docker/cli/cli"
 	"github.com/docker/compose/v2/pkg/api"
@@ -31,7 +33,7 @@ import (
 )
 
 func (s *composeService) Up(ctx context.Context, project *types.Project, options api.UpOptions) error {
-	err := progress.Run(ctx, func(ctx context.Context) error {
+	err := progress.Run(ctx, tracing.SpanWrapFunc("project/up", tracing.ProjectOptions(project), func(ctx context.Context) error {
 		err := s.create(ctx, project, options.Create)
 		if err != nil {
 			return err
@@ -40,12 +42,16 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 			return s.start(ctx, project.Name, options.Start, nil)
 		}
 		return nil
-	})
+	}), s.stdinfo())
 	if err != nil {
 		return err
 	}
 
 	if options.Start.Attach == nil {
+		return err
+	}
+	if s.dryRun {
+		fmt.Fprintln(s.stdout(), "end of 'compose up' output, interactive run is not supported in dry-run mode")
 		return err
 	}
 
@@ -55,6 +61,7 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	stopFunc := func() error {
+		fmt.Fprintln(s.stdinfo(), "Aborting on container exit...")
 		ctx := context.Background()
 		return progress.Run(ctx, func(ctx context.Context) error {
 			go func() {
@@ -69,25 +76,28 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 				Services: options.Create.Services,
 				Project:  project,
 			})
-		})
+		}, s.stdinfo())
 	}
+
+	var isTerminated bool
+	eg, ctx := errgroup.WithContext(ctx)
 	go func() {
 		<-signalChan
+		isTerminated = true
 		printer.Cancel()
-		fmt.Println("Gracefully stopping... (press Ctrl+C again to force)")
-		stopFunc() //nolint:errcheck
+		fmt.Fprintln(s.stdinfo(), "Gracefully stopping... (press Ctrl+C again to force)")
+		eg.Go(stopFunc)
 	}()
 
 	var exitCode int
-	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		code, err := printer.Run(context.Background(), options.Start.CascadeStop, options.Start.ExitCodeFrom, stopFunc)
+		code, err := printer.Run(options.Start.CascadeStop, options.Start.ExitCodeFrom, stopFunc)
 		exitCode = code
 		return err
 	})
 
 	err = s.start(ctx, project.Name, options.Start, printer.HandleEvent)
-	if err != nil {
+	if err != nil && !isTerminated { // Ignore error if the process is terminated
 		return err
 	}
 
